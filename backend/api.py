@@ -1,21 +1,13 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from pathlib import Path
-import io
-import zipfile
 import shutil
 import ast
 import operator
 import requests
 import re
-import json
-import subprocess
-import tempfile
-import wave
-import threading
 
 from .database import (
     initialize_database,
@@ -43,6 +35,7 @@ from .web_search import web_search
 from .memory import extract_memory
 
 from .agent import run_agent
+from .tools.code_executor import execute_code
 
 
 # =========================================================
@@ -54,11 +47,6 @@ APP_NAME = "Nova Local AI"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
 MODEL = "llama3:latest"
-
-# Offline voice transcription (download the Vosk English model once; then it works offline).
-VOICE_MODEL_DIR = Path(__file__).resolve().parent / "models" / "vosk-model-small-en-in-0.4"
-_vosk_model = None
-_vosk_lock = threading.Lock()
 
 
 # =========================================================
@@ -74,10 +62,6 @@ BASE_DIR = (
 DATA_DIR = BASE_DIR / "data"
 
 DOCUMENTS_DIR = DATA_DIR / "documents"
-
-# Generated coding projects are isolated from the application source tree.
-GENERATED_PROJECTS_DIR = BASE_DIR / "generated_projects"
-GENERATED_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
 DOCUMENTS_DIR.mkdir(
     parents=True,
@@ -133,21 +117,6 @@ class ConversationCreateRequest(BaseModel):
 
 class ConversationRenameRequest(BaseModel):
     title: str
-
-
-class CodingGenerateRequest(BaseModel):
-    prompt: str
-    conversation_id: str | None = None
-
-
-class CodingFile(BaseModel):
-    path: str
-    content: str
-
-
-class CodingCreateRequest(BaseModel):
-    project_name: str
-    files: list[CodingFile]
 
 
 # =========================================================
@@ -575,39 +544,8 @@ Do not interpret RAG as Red, Amber, Green.
 # GENERAL ANSWER
 # =========================================================
 
-def get_recent_conversation_context(
-    conversation_id: str | None,
-    max_messages: int = 12,
-):
-    """Return recent turns so follow-up questions retain their topic."""
-    if not conversation_id:
-        return "No previous conversation available."
-
-    try:
-        messages = load_conversation_messages(conversation_id)
-    except Exception as error:
-        print("CONVERSATION CONTEXT ERROR:", error)
-        return "Previous conversation unavailable."
-
-    # The latest user message is already included separately below.
-    if messages:
-        messages = messages[:-1]
-
-    lines = []
-    for message in messages[-max_messages:]:
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role", "")
-        content = message.get("content", "")
-        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
-            lines.append(f"{role}: {content.strip()}")
-
-    return "\n".join(lines) or "No previous conversation available."
-
-
 def answer_general(
-    user_message: str,
-    conversation_id: str | None = None,
+    user_message: str
 ):
 
     memory_context = (
@@ -620,10 +558,6 @@ def answer_general(
         )
     )
 
-    conversation_context = get_recent_conversation_context(
-        conversation_id
-    )
-
     prompt = f"""
 {SYSTEM_PROMPT}
 
@@ -634,18 +568,11 @@ Relevant long-term memory:
 {memory_context}
 
 Use memory only when relevant.
+
 Do not invent memories.
 
-Recent conversation:
-{conversation_context}
+User question:
 
-Use the recent conversation to understand follow-up questions,
-pronouns, and references such as "it", "this party", and "tell me more".
-Continue the existing topic unless the user clearly changes the subject.
-Do not replace the current topic with unrelated topics or generic descriptions
-of your own capabilities.
-
-Latest user question:
 {user_message}
 """
 
@@ -898,7 +825,71 @@ User question:
         answer,
         search_data["sources"]
     )
+# =========================================================
+# CALCULATOR
+# =========================================================
 
+def answer_calculator(user_message: str):
+    expression = user_message.strip()
+
+    expression = re.sub(
+        r"(?i)^\s*(please\s+)?(calculate|compute|what is|what's|solve)\s*",
+        "",
+        expression,
+    ).strip().rstrip("?.!")
+
+    if not re.fullmatch(r"[0-9\s.+\-*/()%]+", expression):
+        return "Please enter a basic arithmetic expression."
+
+    try:
+        tree = ast.parse(expression, mode="eval")
+
+        def evaluate(node):
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body)
+
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+                    return node.value
+                raise ValueError("Invalid number.")
+
+            if isinstance(node, ast.BinOp):
+                operations = {
+                    ast.Add: operator.add,
+                    ast.Sub: operator.sub,
+                    ast.Mult: operator.mul,
+                    ast.Div: operator.truediv,
+                    ast.FloorDiv: operator.floordiv,
+                    ast.Mod: operator.mod,
+                    ast.Pow: operator.pow,
+                }
+
+                operation = operations.get(type(node.op))
+                if operation is None:
+                    raise ValueError("Unsupported operation.")
+
+                left = evaluate(node.left)
+                right = evaluate(node.right)
+
+                if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                    raise ValueError("Exponent is too large.")
+
+                return operation(left, right)
+
+            if isinstance(node, ast.UnaryOp):
+                if isinstance(node.op, ast.UAdd):
+                    return evaluate(node.operand)
+                if isinstance(node.op, ast.USub):
+                    return -evaluate(node.operand)
+
+            raise ValueError("Unsupported expression.")
+
+        return f"Result: {evaluate(tree)}"
+
+    except ZeroDivisionError:
+        return "Calculation error: division by zero."
+    except Exception as error:
+        return f"Calculation error: {error}"
 
 # =========================================================
 # CODE ANSWER
@@ -906,78 +897,149 @@ User question:
 
 
 def answer_code(user_message: str):
-    """
-    Nova's coding problem solver.
-    Code execution is optional; solving the problem is the priority.
-    """
+    """Answer coding questions and execute explicitly requested code.
 
+    Execution is only attempted when the user explicitly asks to run/execute
+    supplied code. The local executor is not a secure sandbox; do not expose
+    this endpoint to untrusted users without OS-level isolation.
+    """
+    execution_requested = bool(
+        re.search(r"\b(run|execute|test)\b", user_message, re.IGNORECASE)
+        and re.search(
+            r"```|\b(code|python|javascript|typescript|program|snippet)\b",
+            user_message,
+            re.IGNORECASE,
+        )
+    )
+
+    if execution_requested:
+        # Prefer a fenced code block, e.g. ```python ... ```.
+        fenced = re.search(
+            r"```\s*([\w+#.-]*)\s*\n(.*?)```",
+            user_message,
+            flags=re.DOTALL,
+        )
+        language = "python"
+        code = ""
+
+        if fenced:
+            language_label = (fenced.group(1) or "python").strip().lower()
+            language_map = {
+                "py": "python", "python3": "python",
+                "js": "javascript", "node": "javascript",
+                "ts": "typescript", "c++": "cpp",
+                "c#": "csharp", "golang": "go", "rs": "rust",
+            }
+            language = language_map.get(language_label, language_label)
+            code = fenced.group(2).strip()
+        else:
+            # For plain-text prompts, start at the first recognizable code line.
+            lines = user_message.splitlines()
+            start_index = None
+            code_start = re.compile(
+                r"^\s*(print\s*\(|raise\s+|import\s+|from\s+\w+\s+import\b|"
+                r"def\s+\w+\s*\(|class\s+\w+\b|if\s+__name__|"
+                r"console\.log\s*\(|SELECT\b|CREATE\s+TABLE\b|"
+                r"public\s+class\s+Main\b|#include\s*[<\"])",
+                flags=re.IGNORECASE,
+            )
+            for index, line in enumerate(lines):
+                if code_start.search(line):
+                    start_index = index
+                    break
+            if start_index is not None:
+                code = "\n".join(lines[start_index:]).strip()
+                language_match = re.search(
+                    r"\b(python|python3|py|javascript|js|node|typescript|ts|sql|java|c\+\+|cpp|c|php|go|golang|rust|rs)\b",
+                    user_message[:start_index and sum(len(x) + 1 for x in lines[:start_index]) or 0],
+                    flags=re.IGNORECASE,
+                )
+                if language_match:
+                    language = language_match.group(1).lower()
+                    language = {
+                        "py": "python", "python3": "python", "js": "javascript",
+                        "node": "javascript", "ts": "typescript", "c++": "cpp",
+                        "golang": "go", "rs": "rust",
+                    }.get(language, language)
+
+        if code:
+            result = execute_code(language, code, timeout_seconds=8)
+            if result.get("success"):
+                stdout = result.get("stdout", "") or "(No standard output.)"
+                stderr = result.get("stderr", "")
+                answer = (
+                    f"**Actual execution result**\n\n"
+                    f"- Language: `{result.get('language', language)}`\n"
+                    f"- Status: Success\n"
+                    f"- Exit code: `{result.get('return_code', 0)}`\n"
+                    f"- Duration: `{result.get('duration_seconds', 'unknown')}` seconds\n\n"
+                    f"**Output**\n```text\n{stdout}\n```"
+                )
+                if stderr:
+                    answer += f"\n\n**Warnings / stderr**\n```text\n{stderr}\n```"
+                return answer
+
+            error_text = result.get("error") or result.get("stderr") or "Execution failed."
+            stdout = result.get("stdout", "")
+            answer = (
+                f"**Code execution failed**\n\n"
+                f"- Language: `{result.get('language', language)}`\n"
+                f"- Phase: `{result.get('phase', 'run')}`\n\n"
+                f"**Error**\n```text\n{error_text}\n```"
+            )
+            if stdout:
+                answer += f"\\n\\n**Output before failure**\\n```text\\n{stdout}\\n```"
+
+            # Diagnose the actual executor failure and suggest a correction.
+            # Suggested code is NOT executed automatically.
+            repair_prompt = f"""
+You are Nova's coding debugger. Diagnose the actual execution failure.
+Suggest the smallest reasonable correction. Do not claim the corrected code
+has been run. Return a brief explanation, one corrected code block in {language},
+and a short description of the change.
+
+Original user request:
+{user_message}
+
+Original code:
+```{language}
+{code}
+```
+
+Actual executor error:
+{error_text}
+
+Output before failure:
+{stdout or "(none)"}
+
+Base your diagnosis only on this error. Do not invent execution results.
+"""
+            repair_suggestion = ask_ollama(repair_prompt)
+            if repair_suggestion and repair_suggestion.strip():
+                answer += (
+                    "\\n\\n**Suggested fix (not yet executed)**\\n\\n"
+                    + repair_suggestion.strip()
+                )
+            else:
+                answer += (
+                    "\\n\\nNova could not generate a repair suggestion. "
+                    "Ask Nova to debug the error and propose corrected code."
+                )
+            return answer
+
+    # Normal coding assistance: do not claim code has been executed.
     prompt = f"""
 You are Nova, an expert programming assistant.
-
-YOUR MAIN GOAL:
-Solve the user's programming problem accurately.
-Do not require code execution to provide a solution.
-
-You can help with:
-- Python, Java, C, C++, JavaScript, TypeScript, PHP,
-  SQL, Go, Rust and other programming languages.
-- Coding problems and algorithmic challenges.
-- Syntax errors, runtime errors and compiler errors.
-- Debugging incomplete or incorrect programs.
-- Improving code quality, performance and readability.
-- Explaining unfamiliar code.
-- Building complete programs from natural-language prompts.
-
-HOW TO HANDLE THE USER'S REQUEST:
-
-1. Identify the programming language when possible.
-2. Determine whether the user wants a solution, debugging,
-   explanation, optimization, or code generation.
-3. If code or an error message is provided, inspect it
-   carefully and identify the likely cause.
-4. Provide a corrected, complete solution whenever enough
-   information is available.
-5. Explain the root cause and important changes.
-6. If the request is ambiguous, state your assumption or
-   ask one concise clarifying question.
-7. Never claim that code was executed or tested unless
-   a tool actually executed it.
-8. If the solution cannot be verified, say so honestly.
-9. Do not invent compiler output, test results, APIs,
-   library functions, or error messages.
-10. Prefer practical solutions that the user can copy
-    and use immediately.
-
-RESPONSE FORMAT:
-
-For a debugging request:
-- Problem identified
-- Why it happens
-- Complete corrected code
-- How to apply the fix
-
-For a coding prompt:
-- Brief explanation of the approach
-- Complete code
-- How to run or use it, when relevant
-
-For a simple question, answer directly without forcing
-all the sections above.
-
-If the user provides only an error message, explain the
-likely cause and the information needed to diagnose it
-more precisely if the message alone is insufficient.
-
-Do not execute code unless execution is explicitly
-requested or a verification tool is deliberately used.
+Help with coding, debugging, explaining, and improving code in common languages.
+Inspect supplied code carefully, give a complete practical answer, and explain
+important fixes when useful. Never claim code was executed or tested unless the
+code execution tool actually ran it. If execution was not requested, do not run it.
 
 USER REQUEST:
 {user_message}
 
-Now solve the user's actual request. Do not merely
-describe how you would solve it.
+Answer the user's actual request clearly and accurately.
 """
-
     return ask_ollama(prompt)
 
 
@@ -1580,43 +1642,6 @@ def remove_conversation(conversation_id: str):
 
 
 # =========================================================
-# MEMORY-FIRST ROUTING
-# =========================================================
-
-def is_personal_memory_question(message: str) -> bool:
-    """Detect questions about saved user facts or earlier chats."""
-    text = re.sub(r"\s+", " ", message.lower().strip())
-    patterns = [
-        r"\bwhat do you remember about me\b",
-        r"\bwhat is my name\b", r"\bwhat's my name\b",
-        r"\bwho am i\b", r"\bwhat do you know about me\b",
-        r"\bwhat (?:is|was) my (?:main )?project\b",
-        r"\bwhat project am i building\b",
-        r"\bwhich technologies am i using\b",
-        r"\bwhat technologies am i using\b",
-        r"\bwhat (?:specific )?technologies did i tell you\b",
-        r"\bwhich (?:specific )?technologies did i tell you\b",
-        r"\bwhat did i tell you\b", r"\bwhat have i told you\b",
-        r"\bwhat did i ask you before\b", r"\bprevious conversation\b",
-        r"\bprevious chat\b", r"\blast conversation\b",
-        r"\blast chat\b", r"\bmy saved memories\b",
-        r"\bremember(?:ed)? about me\b",
-    ]
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def explicitly_requests_web(message: str) -> bool:
-    """Only treat web as requested when the user asks for it or needs live data."""
-    text = message.lower()
-    phrases = (
-        "search the web", "search online", "look online", "look it up online",
-        "on the internet", "web search", "find sources", "give me sources",
-        "provide sources", "with web sources", "search the internet",
-    )
-    return any(phrase in text for phrase in phrases)
-
-
-# =========================================================
 # CHAT ENDPOINT
 # =========================================================
 
@@ -1696,70 +1721,157 @@ def chat(
         )
 
     # =====================================================
-    # DETERMINISTIC ROUTING (NO AGENT-FIRST WEB SEARCH)
+    # EXPLICIT CODE EXECUTION DETECTION
     # =====================================================
 
-    # Personal-memory and document requests must be handled before any agent
-    # planner can reinterpret them as web searches.
-    sources = []
-    used_tools = []
+    # Route explicit execution requests directly to the real local executor.
+    # Do not let the agent/web-search tools intercept these requests.
+    explicit_execution_request = bool(
+        re.search(r"\b(run|execute|test)\b", user_message, re.IGNORECASE)
+        and re.search(
+            r"```|\b(code|python|javascript|typescript|program|snippet)\b",
+            user_message,
+            re.IGNORECASE,
+        )
+    )
 
-    if is_personal_memory_question(user_message):
-        intent = "memory"
-        answer = answer_memory(user_message, conversation_id)
+    # =====================================================
+    # AGENT
+    # =====================================================
 
+    if explicit_execution_request:
+        agent_data = {
+            "used_tools": [],
+            "results": [],
+        }
+        print("DIRECT CODE EXECUTION REQUEST: skipping agent tools")
     else:
         try:
-            intent = route_request(user_message)
+            agent_data = run_agent(user_message)
         except Exception as error:
-            print("ROUTER ERROR:", error)
+            print("AGENT ERROR:", error)
+            agent_data = {
+                "used_tools": [],
+                "results": [],
+            }
+
+    used_tools = agent_data.get(
+        "used_tools",
+        []
+    )
+
+    if not isinstance(
+        used_tools,
+        list
+    ):
+        used_tools = []
+
+    # =====================================================
+    # AGENT MODE
+    # =====================================================
+
+    if used_tools:
+
+        print(
+            "AGENT MODE ACTIVATED"
+        )
+
+        try:
+
+            answer, sources = (
+                answer_agent_task(
+                    user_message,
+                    agent_data
+                )
+            )
+
+        except Exception as error:
+
+            print(
+                "AGENT ANSWER ERROR:",
+                error
+            )
+
+            answer = answer_general(
+                user_message
+            )
+
+            sources = []
+
+        intent = "agent"
+
+    # =====================================================
+    # NORMAL ROUTER
+    # =====================================================
+
+    else:
+
+        try:
+            if explicit_execution_request:
+                intent = "code"
+            else:
+                intent = route_request(user_message)
+
+        except Exception as error:
+
+            print(
+                "ROUTER ERROR:",
+                error
+            )
+
             intent = "general"
 
-        # The multi-tool agent is reserved for requests that explicitly ask
-        # for web research AND a calculation. Ordinary conversation never
-        # invokes the agent planner, preventing unsolicited web sources.
-        calculation_words = (
-            "calculate", "calculation", "divide", "multiply", "percentage",
-            "percent", "ratio", "average", "how many", "how much",
+        print(
+            "NOVA INTENT:",
+            intent
         )
-        if (
-            intent == "web"
-            and explicitly_requests_web(user_message)
-            and any(word in user_message.lower() for word in calculation_words)
-        ):
-            try:
-                agent_data = run_agent(user_message)
-                agent_tools = agent_data.get("used_tools", []) if isinstance(agent_data, dict) else []
-                if agent_tools:
-                    answer, sources = answer_agent_task(user_message, agent_data)
-                    used_tools = agent_tools
-                    intent = "agent"
-                else:
-                    answer, sources = answer_web(user_message)
-                    used_tools = ["web_search"]
-            except Exception as error:
-                print("AGENT ERROR:", error)
-                answer, sources = answer_web(user_message)
-                used_tools = ["web_search"]
-        elif intent == "general":
-            answer = answer_general(user_message, conversation_id)
+
+        sources = []
+
+        if intent == "general":
+
+            answer = answer_general(
+                user_message
+            )
+
         elif intent == "memory":
-            answer = answer_memory(user_message, conversation_id)
+
+            answer = answer_memory(
+                user_message,
+                conversation_id
+            )
+
         elif intent == "rag":
-            answer, sources = answer_rag(user_message)
+
+            answer, sources = answer_rag(
+                user_message
+            )
+
         elif intent == "calculator":
-            answer = answer_calculator(user_message)
-            used_tools = ["calculator"]
+
+            answer = answer_calculator(
+                user_message
+            )
+
         elif intent == "code":
-            answer = answer_code(user_message)
+
+            answer = answer_code(
+                user_message
+            )
+
         elif intent == "web":
-            # Web sources are returned only for explicit web/live-information
-            # intents classified by the router, never from an agent guessing.
-            answer, sources = answer_web(user_message)
-            used_tools = ["web_search"]
+
+            answer, sources = answer_web(
+                user_message
+            )
+
         else:
+
+            answer = answer_general(
+                user_message
+            )
+
             intent = "general"
-            answer = answer_general(user_message)
 
     # =====================================================
     # SAVE ASSISTANT MESSAGE
@@ -1800,324 +1912,16 @@ def chat(
     return {
         "answer": answer,
         "intent": intent,
-        "sources": sources,
+        # Web search can still inform answers, but source cards/links are hidden.
+        "sources": [],
         "tools": used_tools,
         "conversation_id": conversation_id,
     }
 
 
 # =========================================================
-# CODING MODE: MULTI-FILE GENERATION AND SAFE PROJECT CREATION
-# =========================================================
-
-
-def _safe_project_slug(value: str) -> str:
-    """Return a simple folder name; never allow paths from user input."""
-    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-_")
-    return slug[:60] or "nova-project"
-
-
-def _safe_relative_file_path(value: str) -> Path:
-    """Validate a generated file path and reject traversal/absolute paths."""
-    raw = (value or "").replace("\\", "/").strip()
-    candidate = Path(raw)
-    if not raw or candidate.is_absolute() or any(part in ("", ".", "..") for part in raw.split("/")):
-        raise HTTPException(status_code=400, detail=f"Unsafe generated file path: {value!r}")
-    if re.match(r"^[a-zA-Z]:", raw):
-        raise HTTPException(status_code=400, detail="Absolute file paths are not allowed.")
-    if len(raw) > 180:
-        raise HTTPException(status_code=400, detail="Generated file path is too long.")
-    return candidate
-
-
-@app.post("/coding/generate")
-def coding_generate(request: CodingGenerateRequest):
-    """Generate a bounded multi-file project description; no files are written here."""
-    prompt_text = request.prompt.strip()
-    if not prompt_text:
-        raise HTTPException(status_code=400, detail="Describe the project you want Nova to build.")
-    if len(prompt_text) > 12000:
-        raise HTTPException(status_code=413, detail="Coding request is too long. Please shorten it.")
-
-    conversation_id = request.conversation_id
-    if conversation_id:
-        if get_conversation(conversation_id) is None:
-            raise HTTPException(status_code=404, detail="Conversation not found. Start a new chat.")
-    else:
-        conversation_id = create_conversation()
-
-    system = """You are Nova Coding Mode, a practical software developer.
-Generate working code, not generic advice. For the user's request, produce a small but useful complete first version.
-Return ONLY valid JSON, no Markdown fences, with this exact schema:
-{"project_name":"short-folder-name","summary":"brief description","files":[{"path":"index.html","content":"complete file contents"}]}
-Rules:
-- Include between 1 and 8 files, choosing a sensible structure for the requested stack.
-- Every file must be complete, not a placeholder or an instruction to fill it later.
-- For a basic HTML/CSS/JS frontend, separate index.html, style.css, and script.js when useful.
-- Use relative paths only; no absolute paths, parent traversal, secrets, or destructive scripts.
-- Keep the first version reasonably sized and make the interactions requested by the user work.
-- Do not claim that the code has been executed or tested.
-- Escape JSON strings correctly. Output valid JSON only."""
-
-    # Include a little conversation context so coding follow-ups work naturally.
-    recent_context = ""
-    if conversation_id:
-        try:
-            recent = load_conversation_messages(conversation_id)
-            recent = recent[:-1] if recent else []
-            recent_context = "\n".join(
-                f"{item.get('role', '')}: {item.get('content', '')}"
-                for item in recent[-8:]
-                if isinstance(item, dict) and item.get("role") in ("user", "assistant")
-            )
-        except Exception as error:
-            print("CODING CONTEXT ERROR:", error)
-
-    full_prompt = (
-        f"Recent conversation (for context only):\n{recent_context or 'None'}\n\n"
-        f"User's project request:\n{prompt_text}\n\n"
-        "Create the project now. Return the JSON object only."
-    )
-
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": full_prompt},
-                ],
-                "stream": False,
-                "format": "json",
-                "options": {"num_predict": 8192, "temperature": 0.2},
-            },
-            timeout=300,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        raw = payload.get("message", {}).get("content", "")
-        generated = json.loads(raw)
-        files = generated.get("files") if isinstance(generated, dict) else None
-        if not isinstance(files, list) or not 1 <= len(files) <= 8:
-            raise ValueError("Model response did not contain 1 to 8 files.")
-        clean_files = []
-        for item in files:
-            if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("content"), str):
-                raise ValueError("A generated file was missing its path or content.")
-            safe_path = _safe_relative_file_path(item["path"])
-            content = item["content"]
-            if len(content) > 100_000:
-                raise ValueError(f"Generated file is too large: {safe_path.as_posix()}")
-            clean_files.append({"path": safe_path.as_posix(), "content": content})
-        project_name = _safe_project_slug(str(generated.get("project_name") or "nova-project"))
-        summary = str(generated.get("summary") or "Generated a first version of the requested project.")[:1000]
-        answer = f"Coding Mode prepared {len(clean_files)} file(s) for {project_name}. Review the files below. No files have been written yet."
-        try:
-            save_conversation_message(conversation_id, "user", prompt_text)
-            save_conversation_message(conversation_id, "assistant", answer)
-        except Exception as error:
-            print("CODING HISTORY SAVE ERROR:", error)
-        return {
-            "success": True,
-            "conversation_id": conversation_id,
-            "project_name": project_name,
-            "summary": summary,
-            "answer": answer,
-            "files": clean_files,
-            "created": False,
-        }
-    except HTTPException:
-        raise
-    except (ValueError, json.JSONDecodeError) as error:
-        print("CODING JSON ERROR:", error)
-        raise HTTPException(
-            status_code=502,
-            detail="Nova could not produce a valid multi-file project in this response. Try a smaller first version or ask for fewer features.",
-        ) from error
-    except Exception as error:
-        print("CODING GENERATION ERROR:", error)
-        raise HTTPException(status_code=502, detail="Coding Mode could not reach Ollama or generate the project. Check that Ollama is running.") from error
-
-
-@app.post("/coding/create")
-def coding_create(request: CodingCreateRequest):
-    """Create files only after an explicit frontend approval; never overwrite anything."""
-    if not request.files:
-        raise HTTPException(status_code=400, detail="No generated files were supplied.")
-    if len(request.files) > 8:
-        raise HTTPException(status_code=400, detail="A project can contain at most 8 files per creation request.")
-
-    slug = _safe_project_slug(request.project_name)
-    root = (GENERATED_PROJECTS_DIR / slug).resolve()
-    base = GENERATED_PROJECTS_DIR.resolve()
-    if root == base or base not in root.parents:
-        raise HTTPException(status_code=400, detail="Invalid project folder.")
-    if root.exists():
-        raise HTTPException(status_code=409, detail=f"Project folder already exists: {root}. Choose a new project name; Nova will not overwrite files.")
-
-    prepared = []
-    total_bytes = 0
-    for file_item in request.files:
-        relative = _safe_relative_file_path(file_item.path)
-        content = file_item.content
-        total_bytes += len(content.encode("utf-8"))
-        if len(content) > 100_000:
-            raise HTTPException(status_code=413, detail=f"File is too large: {relative.as_posix()}")
-        target = (root / relative).resolve()
-        if target != root and root not in target.parents:
-            raise HTTPException(status_code=400, detail="A file path escapes the approved project folder.")
-        if any(existing[0] == relative for existing in prepared):
-            raise HTTPException(status_code=400, detail=f"Duplicate file path: {relative.as_posix()}")
-        prepared.append((relative, content))
-    if total_bytes > 500_000:
-        raise HTTPException(status_code=413, detail="Generated project is too large (500 KB maximum per creation request).")
-
-    # Atomic-ish creation with rollback if a write fails. The directory must be new.
-    try:
-        root.mkdir(parents=False, exist_ok=False)
-        written = []
-        for relative, content in prepared:
-            target = root / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                raise FileExistsError(str(target))
-            with target.open("x", encoding="utf-8", newline="") as handle:
-                handle.write(content)
-            written.append(target)
-    except Exception as error:
-        shutil.rmtree(root, ignore_errors=True)
-        print("CODING FILE CREATE ERROR:", error)
-        raise HTTPException(status_code=500, detail="Nova could not safely create the project files. No partial project was kept.") from error
-
-    return {
-        "success": True,
-        "project_name": slug,
-        "project_path": str(root),
-        "files": [relative.as_posix() for relative, _ in prepared],
-        "message": f"Created {len(prepared)} files in {root}. Existing files were not overwritten.",
-    }
-
-
-@app.post("/coding/zip")
-def coding_download_zip(request: CodingCreateRequest):
-    """Package reviewed generated files as a ZIP without writing them to disk."""
-    if not request.files:
-        raise HTTPException(status_code=400, detail="No generated files were supplied.")
-    if len(request.files) > 8:
-        raise HTTPException(status_code=400, detail="A project can contain at most 8 files per ZIP.")
-
-    project_name = _safe_project_slug(request.project_name)
-    buffer = io.BytesIO()
-    total_bytes = 0
-    seen = set()
-    try:
-        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for item in request.files:
-                relative = _safe_relative_file_path(item.path)
-                name = relative.as_posix()
-                if name in seen:
-                    raise HTTPException(status_code=400, detail=f"Duplicate file path: {name}")
-                seen.add(name)
-                encoded = item.content.encode("utf-8")
-                total_bytes += len(encoded)
-                if len(encoded) > 100_000:
-                    raise HTTPException(status_code=413, detail=f"File is too large: {name}")
-                archive.writestr(f"{project_name}/{name}", encoded)
-                if total_bytes > 500_000:
-                    raise HTTPException(status_code=413, detail="Generated project is too large (500 KB maximum).")
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(status_code=400, detail="Could not package the generated project.") from error
-
-    buffer.seek(0)
-    return StreamingResponse(
-        buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{project_name}.zip"'},
-    )
-
-
-# =========================================================
 # PDF UPLOAD
 # =========================================================
-
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
-    """Transcribe a short browser recording locally with Vosk; no speech cloud API is used."""
-    global _vosk_model
-    if not VOICE_MODEL_DIR.is_dir():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Offline voice model is missing. Download and extract "
-                "vosk-model-small-en-in-0.4 into backend/models/ first."
-            ),
-        )
-    try:
-        from vosk import Model, KaldiRecognizer
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail="Offline voice package missing. Run: pip install vosk") from exc
-
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise HTTPException(
-            status_code=503,
-            detail="FFmpeg is required to decode browser audio. Install FFmpeg and add it to PATH, then restart FastAPI.",
-        )
-
-    raw_path = None
-    wav_path = None
-    try:
-        suffix = ".mp4" if (file.filename or "").lower().endswith(".mp4") else ".webm"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as raw:
-            raw_path = raw.name
-            shutil.copyfileobj(file.file, raw)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as converted:
-            wav_path = converted.name
-        conversion = subprocess.run(
-            [ffmpeg, "-y", "-loglevel", "error", "-i", raw_path, "-ar", "16000", "-ac", "1", "-f", "wav", wav_path],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if conversion.returncode != 0:
-            raise HTTPException(status_code=400, detail="Could not decode the recording. Try recording again in Chrome or Edge.")
-
-        with _vosk_lock:
-            if _vosk_model is None:
-                _vosk_model = Model(str(VOICE_MODEL_DIR))
-            model = _vosk_model
-
-        with wave.open(wav_path, "rb") as audio:
-            if audio.getnchannels() != 1 or audio.getframerate() != 16000 or audio.getsampwidth() != 2:
-                raise HTTPException(status_code=400, detail="Audio format conversion failed. Please record again.")
-            recognizer = KaldiRecognizer(model, audio.getframerate())
-            recognizer.SetWords(False)
-            while True:
-                chunk = audio.readframes(4000)
-                if not chunk:
-                    break
-                recognizer.AcceptWaveform(chunk)
-            result = json.loads(recognizer.FinalResult())
-        return {"text": result.get("text", ""), "language": "en-IN", "offline": True}
-    except HTTPException:
-        raise
-    except subprocess.TimeoutExpired as exc:
-        raise HTTPException(status_code=408, detail="Audio conversion took too long. Try a shorter recording.") from exc
-    except Exception as exc:
-        print("OFFLINE TRANSCRIPTION ERROR:", exc)
-        raise HTTPException(status_code=500, detail="Offline transcription failed. Check the Vosk model and FFmpeg installation.") from exc
-    finally:
-        for path in (raw_path, wav_path):
-            if path:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-        await file.close()
-
 
 @app.post("/upload")
 async def upload_document(

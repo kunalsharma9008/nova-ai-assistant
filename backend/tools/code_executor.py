@@ -1,4 +1,3 @@
-
 import os
 import shutil
 import sqlite3
@@ -6,7 +5,6 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
 
 MAX_CODE_CHARS = 50000
 MAX_OUTPUT_CHARS = 12000
@@ -32,8 +30,24 @@ def clip(text):
 
 
 def run_process(command, cwd, timeout):
-    env = os.environ.copy()
+    """Run a process with a bounded timeout and captured output.
+
+    Important: this is not a security sandbox. Do not run untrusted code
+    without operating-system-level isolation and resource restrictions.
+    """
     started = time.monotonic()
+
+    # Use a minimal environment rather than copying API keys and other secrets
+    # from the parent process into the code execution environment.
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        "WINDIR": os.environ.get("WINDIR", ""),
+        "TEMP": os.environ.get("TEMP", ""),
+        "TMP": os.environ.get("TMP", ""),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    env = {key: value for key, value in env.items() if value}
 
     try:
         result = subprocess.run(
@@ -48,7 +62,6 @@ def run_process(command, cwd, timeout):
             timeout=min(max(int(timeout), 1), MAX_TIMEOUT_SECONDS),
             shell=False,
         )
-
         return {
             "success": result.returncode == 0,
             "return_code": result.returncode,
@@ -56,7 +69,6 @@ def run_process(command, cwd, timeout):
             "stderr": clip(result.stderr),
             "duration_seconds": round(time.monotonic() - started, 3),
         }
-
     except subprocess.TimeoutExpired:
         return {
             "success": False,
@@ -65,7 +77,6 @@ def run_process(command, cwd, timeout):
             "stderr": "",
             "error": f"Execution timed out after {timeout} seconds.",
         }
-
     except OSError as exc:
         return {
             "success": False,
@@ -79,29 +90,54 @@ def run_process(command, cwd, timeout):
 def execute_code(language: str, code: str, timeout_seconds: int = 8):
     """Execute code with an installed local runtime.
 
-    This runner is NOT a secure sandbox. Do not use for
-    untrusted code without OS-level isolation.
+    WARNING: This runner is not a secure sandbox. Running arbitrary code can
+    access files and resources available to the current Windows user. Only use
+    it for trusted code until OS-level isolation is implemented.
     """
+    if not isinstance(language, str):
+        return {
+            "tool": "code_execution",
+            "success": False,
+            "language": "",
+            "error": "Language must be a string.",
+        }
+
     language = ALIASES.get(language.strip().lower(), language.strip().lower())
 
     if not isinstance(code, str) or not code.strip():
-        return {"success": False, "language": language, "error": "No code provided."}
+        return {
+            "tool": "code_execution",
+            "success": False,
+            "language": language,
+            "error": "No code provided.",
+        }
 
     if len(code) > MAX_CODE_CHARS:
-        return {"success": False, "language": language, "error": "Code is too large."}
+        return {
+            "tool": "code_execution",
+            "success": False,
+            "language": language,
+            "error": "Code is too large.",
+        }
+
+    try:
+        timeout = min(max(int(timeout_seconds), 1), MAX_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        timeout = 8
 
     if language == "sql":
         try:
             with sqlite3.connect(":memory:") as connection:
                 cursor = connection.cursor()
-                statements = [s.strip() for s in code.split(";") if s.strip()]
+                statements = [statement.strip() for statement in code.split(";")
+                              if statement.strip()]
                 output = []
 
                 for statement in statements:
                     cursor.execute(statement)
                     if cursor.description:
                         output.append({
-                            "columns": [col[0] for col in cursor.description],
+                            "columns": [column[0] for column in cursor.description],
                             "rows": cursor.fetchmany(200),
                         })
 
@@ -109,15 +145,17 @@ def execute_code(language: str, code: str, timeout_seconds: int = 8):
                     "tool": "code_execution",
                     "success": True,
                     "language": language,
+                    "phase": "run",
                     "stdout": repr(output),
                     "stderr": "",
+                    "return_code": 0,
                 }
-
         except sqlite3.Error as exc:
             return {
                 "tool": "code_execution",
                 "success": False,
                 "language": language,
+                "phase": "run",
                 "error": str(exc),
             }
 
@@ -142,7 +180,8 @@ def execute_code(language: str, code: str, timeout_seconds: int = 8):
         }
 
     runtime, filename = runtimes[language]
-    if not shutil.which(runtime):
+    runtime_path = shutil.which(runtime)
+    if not runtime_path:
         return {
             "tool": "code_execution",
             "success": False,
@@ -155,31 +194,21 @@ def execute_code(language: str, code: str, timeout_seconds: int = 8):
             workdir = Path(temp)
             source = workdir / filename
             source.write_text(code, encoding="utf-8")
-
-            timeout = min(max(int(timeout_seconds), 1), MAX_TIMEOUT_SECONDS)
             binary = workdir / ("program.exe" if os.name == "nt" else "program")
 
             if language == "python":
-                command = [shutil.which("python"), "-I", str(source)]
-
+                command = [runtime_path, "-I", str(source)]
             elif language == "javascript":
-                command = [shutil.which("node"), str(source)]
-
+                command = [runtime_path, str(source)]
             elif language == "typescript":
-                command = [shutil.which("npx"), "--yes", "tsx", str(source)]
-
+                # npx may download packages when run. Only use with trusted code.
+                command = [runtime_path, "--yes", "tsx", str(source)]
             elif language == "php":
-                command = [shutil.which("php"), str(source)]
-
+                command = [runtime_path, str(source)]
             elif language == "go":
-                command = [shutil.which("go"), "run", str(source)]
-
+                command = [runtime_path, "run", str(source)]
             elif language == "java":
-                compiled = run_process(
-                    [shutil.which("javac"), str(source)],
-                    workdir,
-                    timeout,
-                )
+                compiled = run_process([runtime_path, str(source)], workdir, timeout)
                 if not compiled["success"]:
                     return {
                         "tool": "code_execution",
@@ -187,21 +216,24 @@ def execute_code(language: str, code: str, timeout_seconds: int = 8):
                         "phase": "compile",
                         **compiled,
                     }
-                command = [
-                    shutil.which("java"),
-                    "-cp", str(workdir), "Main",
-                ]
-
+                java_path = shutil.which("java")
+                if not java_path:
+                    return {
+                        "tool": "code_execution",
+                        "success": False,
+                        "language": language,
+                        "phase": "run",
+                        "error": "Required runtime 'java' is not installed or not on PATH.",
+                    }
+                command = [java_path, "-cp", str(workdir), "Main"]
             elif language in ("c", "cpp", "rust"):
-                compiler = shutil.which(runtime)
-
                 if language == "rust":
-                    compile_command = [compiler, str(source), "-o", str(binary)]
+                    compile_command = [runtime_path, str(source), "-o", str(binary)]
                 elif language == "c":
-                    compile_command = [compiler, str(source), "-o", str(binary)]
+                    compile_command = [runtime_path, str(source), "-o", str(binary)]
                 else:
                     compile_command = [
-                        compiler, "-std=c++17", str(source), "-o", str(binary)
+                        runtime_path, "-std=c++17", str(source), "-o", str(binary)
                     ]
 
                 compiled = run_process(compile_command, workdir, timeout)
@@ -212,8 +244,14 @@ def execute_code(language: str, code: str, timeout_seconds: int = 8):
                         "phase": "compile",
                         **compiled,
                     }
-
                 command = [str(binary)]
+            else:
+                return {
+                    "tool": "code_execution",
+                    "success": False,
+                    "language": language,
+                    "error": "Unsupported language.",
+                }
 
             result = run_process(command, workdir, timeout)
             return {
@@ -222,7 +260,6 @@ def execute_code(language: str, code: str, timeout_seconds: int = 8):
                 "phase": "run",
                 **result,
             }
-
     except Exception as exc:
         return {
             "tool": "code_execution",
