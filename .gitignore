@@ -1,0 +1,62 @@
+# =========================
+# Python / FastAPI Backend
+# =========================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+# Next.js / Node.js Frontend
+# =========================
+node_modules/
+.next/
+out/
+build/
+dist/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# =========================
+# Secrets and Environment Variables
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Local Databases and Memory
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Uploaded Documents and Local Data
+# =========================
+uploads/
+documents/
+data/
+*.pdf
+
+# =========================
+# AI Models and Cache
+# =========================
+models/
+*.gguf
+.cache/
+ollama_models/
+
+# =========================
+# Logs and Temporary Files
+# =========================
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
